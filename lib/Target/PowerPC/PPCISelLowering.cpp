@@ -586,6 +586,8 @@ PPCTargetLowering::PPCTargetLowering(const PPCTargetMachine &TM,
       AddPromotedToType (ISD::LOAD  , VT, MVT::v4i32);
       setOperationAction(ISD::SELECT, VT, Promote);
       AddPromotedToType (ISD::SELECT, VT, MVT::v4i32);
+      setOperationAction(ISD::VSELECT, VT, Promote);
+      AddPromotedToType (ISD::VSELECT, VT, MVT::v4i32);
       setOperationAction(ISD::SELECT_CC, VT, Promote);
       AddPromotedToType (ISD::SELECT_CC, VT, MVT::v4i32);
       setOperationAction(ISD::STORE, VT, Promote);
@@ -626,7 +628,6 @@ PPCTargetLowering::PPCTargetLowering(const PPCTargetMachine &TM,
       setOperationAction(ISD::SCALAR_TO_VECTOR, VT, Expand);
       setOperationAction(ISD::FPOW, VT, Expand);
       setOperationAction(ISD::BSWAP, VT, Expand);
-      setOperationAction(ISD::VSELECT, VT, Expand);
       setOperationAction(ISD::SIGN_EXTEND_INREG, VT, Expand);
       setOperationAction(ISD::ROTL, VT, Expand);
       setOperationAction(ISD::ROTR, VT, Expand);
@@ -649,6 +650,7 @@ PPCTargetLowering::PPCTargetLowering(const PPCTargetMachine &TM,
     setOperationAction(ISD::LOAD  , MVT::v4i32, Legal);
     setOperationAction(ISD::SELECT, MVT::v4i32,
                        Subtarget.useCRBits() ? Legal : Expand);
+    setOperationAction(ISD::VSELECT, MVT::v4i32, Legal);
     setOperationAction(ISD::STORE , MVT::v4i32, Legal);
     setOperationAction(ISD::FP_TO_SINT, MVT::v4i32, Legal);
     setOperationAction(ISD::FP_TO_UINT, MVT::v4i32, Legal);
@@ -726,12 +728,6 @@ PPCTargetLowering::PPCTargetLowering(const PPCTargetMachine &TM,
 
       setOperationAction(ISD::FDIV, MVT::v2f64, Legal);
       setOperationAction(ISD::FSQRT, MVT::v2f64, Legal);
-
-      setOperationAction(ISD::VSELECT, MVT::v16i8, Legal);
-      setOperationAction(ISD::VSELECT, MVT::v8i16, Legal);
-      setOperationAction(ISD::VSELECT, MVT::v4i32, Legal);
-      setOperationAction(ISD::VSELECT, MVT::v4f32, Legal);
-      setOperationAction(ISD::VSELECT, MVT::v2f64, Legal);
 
       // Share the Altivec comparison restrictions.
       setCondCodeAction(ISD::SETUO, MVT::v2f64, Expand);
@@ -8454,17 +8450,6 @@ SDValue PPCTargetLowering::LowerVECTOR_SHUFFLE(SDValue Op,
     if (V2.isUndef() && PPC::isSplatShuffleMask(SVOp, 4)) {
       int SplatIdx = PPC::getVSPLTImmediate(SVOp, 4, DAG);
 
-      // If the source for the shuffle is a scalar_to_vector that came from a
-      // 32-bit load, it will have used LXVWSX so we don't need to splat again.
-      if (Subtarget.hasP9Vector() &&
-          ((isLittleEndian && SplatIdx == 3) ||
-           (!isLittleEndian && SplatIdx == 0))) {
-        SDValue Src = V1.getOperand(0);
-        if (Src.getOpcode() == ISD::SCALAR_TO_VECTOR &&
-            Src.getOperand(0).getOpcode() == ISD::LOAD &&
-            Src.getOperand(0).hasOneUse())
-          return V1;
-      }
       SDValue Conv = DAG.getNode(ISD::BITCAST, dl, MVT::v4i32, V1);
       SDValue Splat = DAG.getNode(PPCISD::XXSPLT, dl, MVT::v4i32, Conv,
                                   DAG.getConstant(SplatIdx, dl, MVT::i32));
@@ -11761,6 +11746,14 @@ SDValue PPCTargetLowering::DAGCombineExtBoolTrunc(SDNode *N,
       ShiftCst);
 }
 
+// Is this an extending load from an f32 to an f64?
+static bool isFPExtLoad(SDValue Op) {
+  if (LoadSDNode *LD = dyn_cast<LoadSDNode>(Op.getNode()))
+    return LD->getExtensionType() == ISD::EXTLOAD &&
+      Op.getValueType() == MVT::f64;
+  return false;
+}
+
 /// Reduces the number of fp-to-int conversion when building a vector.
 ///
 /// If this vector is built out of floating to integer conversions,
@@ -11795,10 +11788,17 @@ combineElementTruncationToVectorTruncation(SDNode *N,
     SmallVector<SDValue, 4> Ops;
     EVT TargetVT = N->getValueType(0);
     for (int i = 0, e = N->getNumOperands(); i < e; ++i) {
-      if (N->getOperand(i).getOpcode() != PPCISD::MFVSR)
+      SDValue NextOp = N->getOperand(i);
+      if (NextOp.getOpcode() != PPCISD::MFVSR)
         return SDValue();
-      unsigned NextConversion = N->getOperand(i).getOperand(0).getOpcode();
+      unsigned NextConversion = NextOp.getOperand(0).getOpcode();
       if (NextConversion != FirstConversion)
+        return SDValue();
+      // If we are converting to 32-bit integers, we need to add an FP_ROUND.
+      // This is not valid if the input was originally double precision. It is
+      // also not profitable to do unless this is an extending load in which
+      // case doing this combine will allow us to combine consecutive loads.
+      if (Is32Bit && !isFPExtLoad(NextOp.getOperand(0).getOperand(0)))
         return SDValue();
       if (N->getOperand(i) != FirstInput)
         IsSplat = false;
@@ -11813,8 +11813,9 @@ combineElementTruncationToVectorTruncation(SDNode *N,
     // Now that we know we have the right type of node, get its operands
     for (int i = 0, e = N->getNumOperands(); i < e; ++i) {
       SDValue In = N->getOperand(i).getOperand(0);
-      // For 32-bit values, we need to add an FP_ROUND node.
       if (Is32Bit) {
+        // For 32-bit values, we need to add an FP_ROUND node (if we made it
+        // here, we know that all inputs are extending loads so this is safe).
         if (In.isUndef())
           Ops.push_back(DAG.getUNDEF(SrcVT));
         else {
@@ -11991,10 +11992,15 @@ static SDValue combineBVOfVecSExt(SDNode *N, SelectionDAG &DAG) {
   auto isSExtOfVecExtract = [&](SDValue Op) -> bool {
     if (!Op)
       return false;
-    if (Op.getOpcode() != ISD::SIGN_EXTEND)
+    if (Op.getOpcode() != ISD::SIGN_EXTEND &&
+        Op.getOpcode() != ISD::SIGN_EXTEND_INREG)
       return false;
 
+    // A SIGN_EXTEND_INREG might be fed by an ANY_EXTEND to produce a value
+    // of the right width.
     SDValue Extract = Op.getOperand(0);
+    if (Extract.getOpcode() == ISD::ANY_EXTEND)
+      Extract = Extract.getOperand(0);
     if (Extract.getOpcode() != ISD::EXTRACT_VECTOR_ELT)
       return false;
 
@@ -12082,8 +12088,10 @@ SDValue PPCTargetLowering::DAGCombineBuildVector(SDNode *N,
     return Reduced;
 
   // If we're building a vector out of extended elements from another vector
-  // we have P9 vector integer extend instructions.
-  if (Subtarget.hasP9Altivec()) {
+  // we have P9 vector integer extend instructions. The code assumes legal
+  // input types (i.e. it can't handle things like v4i16) so do not run before
+  // legalization.
+  if (Subtarget.hasP9Altivec() && !DCI.isBeforeLegalize()) {
     Reduced = combineBVOfVecSExt(N, DAG);
     if (Reduced)
       return Reduced;

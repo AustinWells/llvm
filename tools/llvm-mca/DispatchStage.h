@@ -38,7 +38,7 @@ class Scheduler;
 // the following conditions are met:
 //  1) There are enough entries in the reorder buffer (see class
 //     RetireControlUnit) to write the opcodes associated with the instruction.
-//  2) There are enough temporaries to rename output register operands.
+//  2) There are enough physical registers to rename output register operands.
 //  3) There are enough entries available in the used buffered resource(s).
 //
 // The number of micro opcodes that can be dispatched in one cycle is limited by
@@ -49,7 +49,7 @@ class Scheduler;
 //
 // If the number of micro opcodes exceedes DispatchWidth, then the instruction
 // is dispatched in multiple cycles.
-class DispatchStage : public Stage {
+class DispatchStage final : public Stage {
   unsigned DispatchWidth;
   unsigned AvailableEntries;
   unsigned CarryOver;
@@ -92,9 +92,9 @@ public:
   // We can always try to dispatch, so returning false is okay in this case.
   // The retire stage, which controls the RCU, might have items to complete but
   // RetireStage::hasWorkToComplete will check for that case.
-  virtual bool hasWorkToComplete() const override final { return false; }
-  virtual void cycleStart() override final;
-  virtual bool execute(InstRef &IR) override final;
+  bool hasWorkToComplete() const override { return false; }
+  void cycleStart() override;
+  Status execute(InstRef &IR) override;
   void notifyDispatchStall(const InstRef &IR, unsigned EventType);
 
 #ifndef NDEBUG

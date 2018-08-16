@@ -95,6 +95,8 @@ protected:
   SDValue performCtlz_CttzCombine(const SDLoc &SL, SDValue Cond, SDValue LHS,
                              SDValue RHS, DAGCombinerInfo &DCI) const;
   SDValue performSelectCombine(SDNode *N, DAGCombinerInfo &DCI) const;
+
+  bool isConstantCostlierToNegate(SDValue N) const;
   SDValue performFNegCombine(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue performFAbsCombine(SDNode *N, DAGCombinerInfo &DCI) const;
   SDValue performRcpCombine(SDNode *N, DAGCombinerInfo &DCI) const;
@@ -245,6 +247,11 @@ public:
   unsigned ComputeNumSignBitsForTargetNode(SDValue Op, const APInt &DemandedElts,
                                            const SelectionDAG &DAG,
                                            unsigned Depth = 0) const override;
+
+  bool isKnownNeverNaNForTargetNode(SDValue Op,
+                                    const SelectionDAG &DAG,
+                                    bool SNaN = false,
+                                    unsigned Depth = 0) const override;
 
   /// Helper function that adds Reg to the LiveIn list of the DAG's
   /// MachineFunction.
